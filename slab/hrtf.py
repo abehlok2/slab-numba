@@ -10,7 +10,10 @@ import pickle
 import bz2
 import numpy
 import datetime
-import itertools
+try:
+    from numba import njit
+except ImportError:
+    njit = None
 try:
     import matplotlib
     from matplotlib import pyplot as plt
@@ -42,6 +45,173 @@ from slab.sound import Sound
 from collections import namedtuple
 
 _kemar = None
+
+if njit:
+    @njit
+    def _barycentric_weights_numba(triangle, point):
+        def dist(p1, p2):
+            return numpy.sqrt(((p1 - p2) ** 2).sum())
+        d1 = dist(point, triangle[0])
+        d2 = dist(point, triangle[1])
+        d3 = dist(point, triangle[2])
+        d12 = dist(triangle[0], triangle[1])
+        d13 = dist(triangle[0], triangle[2])
+        d23 = dist(triangle[1], triangle[2])
+        a0 = 0.0
+        p = (d2 + d3 + d23) / 2.0
+        a0 = numpy.sqrt(p * (p - d2) * (p - d3) * (p - d23))
+        p = (d1 + d3 + d13) / 2.0
+        a1 = numpy.sqrt(p * (p - d1) * (p - d3) * (p - d13))
+        p = (d1 + d2 + d12) / 2.0
+        a2 = numpy.sqrt(p * (p - d1) * (p - d2) * (p - d12))
+        p = (d12 + d13 + d23) / 2.0
+        tot = numpy.sqrt(p * (p - d12) * (p - d13) * (p - d23))
+        sum_a = a0 + a1 + a2
+        return sum_a - tot, numpy.array([a0, a1, a2]) / sum_a
+
+    @njit
+    def _vsi_core_numba(tfs):
+        n_sources = tfs.shape[1]
+        sum_corr = 0.0
+        count = 0
+        for i in range(n_sources):
+            x = tfs[:, i]
+            mean_x = numpy.mean(x)
+            std_x = numpy.std(x)
+            for j in range(i + 1, n_sources):
+                y = tfs[:, j]
+                mean_y = numpy.mean(y)
+                std_y = numpy.std(y)
+                cov = numpy.mean((x - mean_x) * (y - mean_y))
+                corr = cov / (std_x * std_y)
+                sum_corr += corr
+                count += 1
+        return 1.0 - sum_corr / count
+
+    @njit
+    def _sim_echo_core(sim_ord, Lx, Ly, Lz, Sx, Sy, Sz):
+        n_iter = (2 * sim_ord + 1) ** 3 * 8
+        Ix = numpy.empty(n_iter)
+        Iy = numpy.empty(n_iter)
+        Iz = numpy.empty(n_iter)
+        order = numpy.empty(n_iter, dtype=numpy.int64)
+        floor_order = numpy.empty(n_iter, dtype=numpy.int64)
+        ceil_order = numpy.empty(n_iter, dtype=numpy.int64)
+        idx = 0
+        for l in range(-sim_ord, sim_ord + 1):
+            for m in range(-sim_ord, sim_ord + 1):
+                for n in range(-sim_ord, sim_ord + 1):
+                    xl = Sx + 2 * l * Lx
+                    xr = -Sx + 2 * l * Lx
+                    yf = Sy + 2 * m * Ly
+                    yb = -Sy + 2 * m * Ly
+                    zu = Sz + 2 * n * Lz
+                    zd = -Sz + 2 * n * Lz
+                    Ix[idx:idx+8] = numpy.array([xl, xl, xl, xl, xr, xr, xr, xr])
+                    Iy[idx:idx+8] = numpy.array([yf, yf, yb, yb, yf, yf, yb, yb])
+                    Iz[idx:idx+8] = numpy.array([zu, zd, zu, zd, zu, zd, zu, zd])
+                    idx += 8
+        for i in range(n_iter):
+            x = Ix[i]
+            y = Iy[i]
+            z = Iz[i]
+            if x >= 0.0:
+                n_order = numpy.floor(x / Lx)
+            else:
+                n_order = numpy.ceil(-x / Lx)
+            if y >= 0.0:
+                n_order += numpy.floor(y / Ly)
+            else:
+                n_order += numpy.ceil(-y / Ly)
+            if z >= 0.0:
+                n_order += numpy.floor(z / Lz)
+                n_floor_order = numpy.floor(numpy.floor(z / Lz) / 2.0)
+                n_ceil_order = numpy.ceil(numpy.floor(z / Lz) / 2.0)
+            else:
+                n_order += numpy.ceil(-z / Lz)
+                n_floor_order = numpy.ceil(numpy.ceil(-z / Lz) / 2.0)
+                n_ceil_order = numpy.floor(numpy.ceil(-z / Lz) / 2.0)
+            order[i] = int(n_order)
+            floor_order[i] = int(n_floor_order)
+            ceil_order[i] = int(n_ceil_order)
+        return Ix, Iy, Iz, order, floor_order, ceil_order
+else:
+    def _barycentric_weights_numba(triangle, point):
+        dist = lambda p1, p2: numpy.sqrt(((p1 - p2) ** 2).sum())
+        d1 = dist(point, triangle[0])
+        d2 = dist(point, triangle[1])
+        d3 = dist(point, triangle[2])
+        d12 = dist(triangle[0], triangle[1])
+        d13 = dist(triangle[0], triangle[2])
+        d23 = dist(triangle[1], triangle[2])
+        a0 = numpy.sqrt(((d2 + d3 + d23) / 2) * (((d2 + d3 + d23) / 2 - d2) * ((d2 + d3 + d23) / 2 - d3) * ((d2 + d3 + d23) / 2 - d23)))
+        a1 = numpy.sqrt(((d1 + d3 + d13) / 2) * (((d1 + d3 + d13) / 2 - d1) * ((d1 + d3 + d13) / 2 - d3) * ((d1 + d3 + d13) / 2 - d13)))
+        a2 = numpy.sqrt(((d1 + d2 + d12) / 2) * (((d1 + d2 + d12) / 2 - d1) * ((d1 + d2 + d12) / 2 - d2) * ((d1 + d2 + d12) / 2 - d12)))
+        tot = numpy.sqrt(((d12 + d13 + d23) / 2) * (((d12 + d13 + d23) / 2 - d12) * ((d12 + d13 + d23) / 2 - d13) * ((d12 + d13 + d23) / 2 - d23)))
+        sum_a = a0 + a1 + a2
+        return sum_a - tot, numpy.array([a0, a1, a2]) / sum_a
+
+    def _vsi_core_numba(tfs):
+        n_sources = tfs.shape[1]
+        sum_corr = 0.0
+        count = 0
+        for i in range(n_sources):
+            for j in range(i + 1, n_sources):
+                sum_corr += numpy.corrcoef(tfs[:, i], tfs[:, j])[1, 0]
+                count += 1
+        return 1.0 - sum_corr / count
+
+    def _sim_echo_core(sim_ord, Lx, Ly, Lz, Sx, Sy, Sz):
+        Ix = []
+        Iy = []
+        Iz = []
+        order = []
+        floor_order = []
+        ceil_order = []
+        for l in range(-sim_ord, sim_ord + 1):
+            for m in range(-sim_ord, sim_ord + 1):
+                for n in range(-sim_ord, sim_ord + 1):
+                    xl = Sx + 2 * l * Lx
+                    xr = -Sx + 2 * l * Lx
+                    yf = Sy + 2 * m * Ly
+                    yb = -Sy + 2 * m * Ly
+                    zu = Sz + 2 * n * Lz
+                    zd = -Sz + 2 * n * Lz
+                    Ix.extend([xl, xl, xl, xl, xr, xr, xr, xr])
+                    Iy.extend([yf, yf, yb, yb, yf, yf, yb, yb])
+                    Iz.extend([zu, zd, zu, zd, zu, zd, zu, zd])
+        for x, y, z in zip(Ix, Iy, Iz):
+            if x >= 0:
+                n_order = numpy.floor(x / Lx)
+            else:
+                n_order = numpy.ceil(-x / Lx)
+            if y >= 0:
+                n_order += numpy.floor(y / Ly)
+            else:
+                n_order += numpy.ceil(-y / Ly)
+            if z >= 0:
+                n_order += numpy.floor(z / Lz)
+                n_floor_order = numpy.floor(numpy.floor(z / Lz) / 2)
+                n_ceil_order = numpy.ceil(numpy.floor(z / Lz) / 2)
+            else:
+                n_order += numpy.ceil(-z / Lz)
+                n_floor_order = numpy.ceil(numpy.ceil(-z / Lz) / 2)
+                n_ceil_order = numpy.floor(numpy.ceil(-z / Lz) / 2)
+            order.append(int(n_order))
+            floor_order.append(int(n_floor_order))
+            ceil_order.append(int(n_ceil_order))
+        return (numpy.array(Ix), numpy.array(Iy), numpy.array(Iz),
+                numpy.array(order), numpy.array(floor_order), numpy.array(ceil_order))
+
+    def _walltrns_core(hrir_l, hrir_r, wallcoef, floorcoef, total_order, floor_order):
+        for _ in range(total_order - floor_order):
+            hrir_l = numpy.convolve(hrir_l, wallcoef)
+            hrir_r = numpy.convolve(hrir_r, wallcoef)
+        for _ in range(floor_order):
+            hrir_l = numpy.convolve(hrir_l, floorcoef)
+            hrir_r = numpy.convolve(hrir_r, floorcoef)
+        return hrir_l, hrir_r
+
 
 class HRTF:
     """
@@ -716,25 +886,7 @@ class HRTF:
             (None | numpy.array): barycentric weights for a given triangle (array of coordinates of points) and target
             point IF the point is inside the triangle; None if the point is outside the triangle.
         '''
-        # compute barycentric weights via the area of the 3 triangles formed between target and 3 nearest sources:
-        dist = lambda p1, p2: numpy.sqrt(((p1 - p2)**2).sum())
-        d1 = dist(point, triangle[0, :])  # distances from target to each source
-        d2 = dist(point, triangle[1, :])
-        d3 = dist(point, triangle[2, :])
-        d12 = dist(triangle[0, :], triangle[1, :])  # distance between sources 1 and 2
-        d13 = dist(triangle[0, :], triangle[2, :])
-        d23 = dist(triangle[1, :], triangle[2, :])
-        # compute triangle areas from length of sides (distances) with Heron's Formula
-        a = numpy.array([0., 0., 0.])
-        p = (d2 + d3 + d23) / 2
-        a[0] = numpy.sqrt(p * (p-d2) * (p-d3) * (p-d23))
-        p = (d1 + d3 + d13) / 2
-        a[1] = numpy.sqrt(p * (p-d1) * (p-d3) * (p-d13))
-        p = (d1 + d2 + d12) / 2
-        a[2] = numpy.sqrt(p * (p-d1) * (p-d2) * (p-d12))
-        p = (d12 + d13 + d23) / 2
-        tot = numpy.sqrt(p * (p-d12) * (p-d13) * (p-d23))
-        return a.sum() - tot, a / a.sum()  # normalize by total area = barycentric weights of sources in idx_triangle
+        return _barycentric_weights_numba(triangle, point)
 
     def vsi(self, sources=None, equalize=True):
         """
@@ -759,13 +911,7 @@ class HRTF:
             tfs = dtf.tfs_from_sources(sources=sources)
         else:
             tfs = self.tfs_from_sources(sources=sources)
-        sum_corr = 0
-        n = 0
-        for i in range(len(sources)):
-            for j in range(i+1, len(sources)):
-                sum_corr += numpy.corrcoef(tfs[:, i], tfs[:, j])[1, 0]
-                n += 1
-        return 1 - sum_corr / n
+        return _vsi_core_numba(tfs)
 
     def plot_sources(self, idx=None, show=True, label=False, axis=None):
         """
@@ -1048,46 +1194,9 @@ class Room:
             floor_order (list): Number of reflections from the floor for each echo.
             ceil_order (list): Number of reflections from the ceiling for each echo.
         """
-        # calculate source images
         Lx, Ly, Lz = room_size
         Sx, Sy, Sz = source_loc[0,0], source_loc[0,1], source_loc[0,2]
-        Ix = []
-        Iy = []
-        Iz = []
-        order = []
-        floor_order = []
-        ceil_order = []
-        # positions of images, all combinations of mirrored locs along x,y,z axes
-        for (l, m, n) in itertools.product(range(-sim_ord,sim_ord+1), repeat=3):
-            xl =  Sx + 2 * l * Lx
-            xr = -Sx + 2 * l * Lx
-            Ix.extend([xl,xl,xl,xl,xr,xr,xr,xr])
-            yf =  Sy + 2 * m * Ly
-            yb = -Sy + 2 * m * Ly
-            Iy.extend([yf,yf,yb,yb,yf,yf,yb,yb])
-            zu =  Sz + 2 * n * Lz
-            zd = -Sz + 2 * n * Lz
-            Iz.extend([zu,zd,zu,zd,zu,zd,zu,zd])
-        for x, y, z in zip(Ix, Iy, Iz):
-            if x >= 0:
-                n_order = numpy.floor(x/Lx)
-            else:
-                n_order = numpy.ceil(-x/Lx)
-            if y >= 0:
-                n_order = n_order + numpy.floor(y/Ly)
-            else:
-                n_order = n_order + numpy.ceil(-y/Ly)
-            if z >= 0:
-                n_order = n_order + numpy.floor(z/Lz)
-                n_floor_order = numpy.floor(numpy.floor(z/Lz)/2)
-                n_ceil_order = numpy.ceil(numpy.floor(z/Lz)/2)
-            else:
-                n_order = n_order + numpy.ceil(-z/Lz)
-                n_floor_order = numpy.ceil(numpy.ceil(-z/Lz)/2)
-                n_ceil_order = numpy.floor(numpy.ceil(-z/Lz)/2)
-            order.append(int(n_order))
-            floor_order.append(int(n_floor_order))
-            ceil_order.append(int(n_ceil_order))
+        Ix, Iy, Iz, order, floor_order, ceil_order = _sim_echo_core(sim_ord, Lx, Ly, Lz, Sx, Sy, Sz)
         img_locs = numpy.stack([Ix, Iy, Iz], axis=-1)
         # source images are in cartesian, with reference to room coordinate
         # transform it into vertical polar with reference to listener
@@ -1133,14 +1242,7 @@ class Room:
                               0.0006,    0.0005,    0.0005,    0.0004,    0.0004,    0.0004,    0.0003,
                               0.0003,    0.0003,    0.0002,    0.0002,    0.0002,    0.0002,    0.0001,
                               0.0001,    0.0001]) # Coconut Fibre - Roller felt a3.1-1
-        HRIR_l = dry_filter[:, 0]
-        HRIR_r = dry_filter[:, 1]
-        for n in range(total_order - floor_order):
-            HRIR_l = numpy.convolve(HRIR_l, wallcoef)
-            HRIR_r = numpy.convolve(HRIR_r, wallcoef)
-        for n in range(floor_order):
-            HRIR_l = numpy.convolve(HRIR_l, floorcoef)
-            HRIR_r = numpy.convolve(HRIR_r, floorcoef)
+        HRIR_l, HRIR_r = _walltrns_core(dry_filter[:, 0], dry_filter[:, 1], wallcoef, floorcoef, total_order, floor_order)
         return Filter([HRIR_l, HRIR_r], samplerate=dry_filter.samplerate, fir='IR')
 
     def reverb_time(self, size=None, absorption=None):
