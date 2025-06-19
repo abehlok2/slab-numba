@@ -9,6 +9,59 @@ try:
     import scipy.signal
 except ImportError:
     scipy = False
+try:
+    from numba import njit
+except ImportError:
+    njit = None
+
+if njit:
+    @njit
+    def _cos_filterbank_numba(freqs_erb, center_freqs, erb_spacing):
+        n_freqs = len(freqs_erb)
+        n_filters = len(center_freqs)
+        filts = numpy.zeros((n_freqs, n_filters))
+        for i in range(n_filters):
+            l = center_freqs[i] - erb_spacing
+            h = center_freqs[i] + erb_spacing
+            avg = center_freqs[i]
+            width = erb_spacing * 2.0
+            for j in range(n_freqs):
+                fe = freqs_erb[j]
+                if (fe > l) and (fe < h):
+                    filts[j, i] = numpy.cos((fe - avg) / width * numpy.pi)
+        return filts
+
+    @njit
+    def _center_freqs_from_filters(data, freqs):
+        n_filters = data.shape[1]
+        center_freqs = numpy.zeros(n_filters)
+        for i in range(n_filters):
+            idx = numpy.argmax(data[:, i])
+            center_freqs[i] = freqs[idx]
+        return center_freqs
+else:
+    def _cos_filterbank_numba(freqs_erb, center_freqs, erb_spacing):
+        n_freqs = len(freqs_erb)
+        n_filters = len(center_freqs)
+        filts = numpy.zeros((n_freqs, n_filters))
+        for i in range(n_filters):
+            l = center_freqs[i] - erb_spacing
+            h = center_freqs[i] + erb_spacing
+            avg = center_freqs[i]
+            width = erb_spacing * 2.0
+            for j in range(n_freqs):
+                fe = freqs_erb[j]
+                if (fe > l) and (fe < h):
+                    filts[j, i] = numpy.cos((fe - avg) / width * numpy.pi)
+        return filts
+
+    def _center_freqs_from_filters(data, freqs):
+        n_filters = data.shape[1]
+        center_freqs = numpy.zeros(n_filters)
+        for i in range(n_filters):
+            idx = numpy.argmax(data[:, i])
+            center_freqs[i] = freqs[idx]
+        return center_freqs
 
 import slab.signal
 from slab.signal import Signal  # getting the base class
@@ -337,15 +390,8 @@ class Filter(Signal):
             low_cutoff=low_cutoff, high_cutoff=high_cutoff, bandwidth=bandwidth, pass_bands=pass_bands, n_filters=n_filters)
         erb_spacing = erb_spacing * filter_width_factor
         n_filters = len(center_freqs)
-        filts = numpy.zeros((n_freqs, n_filters))
         freqs_erb = Filter._freq2erb(freq_bins)
-        for i in range(n_filters):
-            l = center_freqs[i] - erb_spacing
-            h = center_freqs[i] + erb_spacing
-            avg = center_freqs[i]  # center of filter
-            width = erb_spacing * 2 # width of filter
-            filts[(freqs_erb > l) & (freqs_erb < h), i] = numpy.cos(
-                (freqs_erb[(freqs_erb > l) & (freqs_erb < h)] - avg) / width * numpy.pi)
+        filts = _cos_filterbank_numba(freqs_erb, center_freqs, erb_spacing)
         return Filter(data=filts, samplerate=samplerate, fir='TF')
 
     @staticmethod
@@ -418,11 +464,7 @@ class Filter(Signal):
         if 'IR' in self.fir:
             raise NotImplementedError('Not implemented for FIR filter banks.')
         freqs = self.frequencies
-        center_freqs = numpy.zeros(self.n_filters)
-        for i in range(self.n_filters):  # for each filter
-            idx = numpy.argmax(self.channel(i).data)  # get index of max Gain
-            center_freqs[i] = freqs[idx]  # look-up freqe of index -> centre_freq for that filter
-        return center_freqs
+        return _center_freqs_from_filters(self.data, freqs)
 
     @staticmethod
     def equalizing_filterbank(reference, sound, length=1000, bandwidth=1/8, low_cutoff=200, high_cutoff=None,

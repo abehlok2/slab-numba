@@ -10,6 +10,10 @@ try:
     import scipy.signal
 except ImportError:
     scipy = False
+try:
+    from numba import njit
+except ImportError:
+    njit = None
 
 _default_samplerate = 8000  # default samplerate in Hz; used by all methods if on samplerate argument is provided.
 
@@ -20,6 +24,46 @@ def set_default_samplerate(samplerate):
 def get_default_samplerate():
     global _default_samplerate
     return _default_samplerate
+
+
+if njit:
+    @njit
+    def _dynamic_delay_core(sig, duration, filter_length, center_tap):
+        t = numpy.arange(filter_length)
+        n_samples = len(duration)
+        padding = numpy.zeros(center_tap)
+        padded = numpy.concatenate((padding, sig, padding))
+        out = numpy.zeros(n_samples)
+        for i in range(n_samples):
+            current_delay = duration[i]
+            x = t - current_delay
+            window = 0.54 - 0.46 * numpy.cos(2 * numpy.pi * (x + 0.5) / filter_length)
+            if numpy.abs(current_delay) < 1e-10:
+                tap_weight = numpy.zeros_like(t)
+                tap_weight[center_tap] = 1.0
+            else:
+                tap_weight = window * numpy.sinc(x - center_tap)
+            sig_portion = padded[i:i + filter_length]
+            out[i] = numpy.dot(sig_portion, tap_weight[::-1])
+        return out
+else:
+    def _dynamic_delay_core(sig, duration, filter_length, center_tap):
+        t = numpy.arange(filter_length)
+        n_samples = len(duration)
+        padding = numpy.zeros(center_tap)
+        padded = numpy.concatenate((padding, sig, padding))
+        out = numpy.zeros(n_samples)
+        for i, current_delay in enumerate(duration):
+            x = t - current_delay
+            window = 0.54 - 0.46 * numpy.cos(2 * numpy.pi * (x + 0.5) / filter_length)
+            if numpy.abs(current_delay) < 1e-10:
+                tap_weight = numpy.zeros_like(t)
+                tap_weight[center_tap] = 1.0
+            else:
+                tap_weight = window * numpy.sinc(x - center_tap)
+            sig_portion = padded[i:i + filter_length]
+            out[i] = numpy.dot(sig_portion, tap_weight[::-1])
+        return out
 
 class Signal:
     """
@@ -407,22 +451,8 @@ class Signal:
             if len(duration) != self.n_samples:
                 ValueError('Duration shorter or longer than sound!')
             duration *= self.samplerate  # assuming vector in seconds, convert to samples
-            padding = numpy.zeros(center_tap)
-            # for zero-padded convolution (potential edge artifacts!)
-            sig = numpy.concatenate((padding, new.channel(channel), padding), axis=None)
-            for i, current_delay in enumerate(duration):
-                x = t-current_delay
-                window = 0.54 - 0.46 * numpy.cos(2 * numpy.pi *
-                                                 (x+0.5) / filter_length)  # Hamming window
-                if numpy.abs(current_delay) < 1e-10:
-                    tap_weight = numpy.zeros_like(t)
-                    tap_weight[center_tap] = 1
-                else:
-                    tap_weight = window * numpy.sinc(x-center_tap)
-                    sig_portion = sig[i:i+filter_length]
-                    # sig_portion and tap_weight have the same length, so the valid part of the convolution is just
-                    # one sample, which gets written into the sound at the current index
-                    new.data[i, channel] = numpy.convolve(sig_portion, tap_weight, mode='valid')[0]
+            sig = self.data[:, channel]
+            new.data[:, channel] = _dynamic_delay_core(sig, duration, filter_length, center_tap)
         return new
 
     def plot_samples(self, show=True, axis=None):
